@@ -106,7 +106,7 @@ header.top .code{font:500 .8rem var(--f-mono);color:var(--muted)}
       <button class="btn" id="backBtn" disabled>◀ पीछे</button>
       <button class="btn" id="nextBtn" disabled>अगला ▶</button>
     </div>
-    <div class="hint">बोलकर भी चला सकते हैं: <b>"अगला"</b> · <b>"पीछे"</b> · <b>"दोबारा"</b> · <b>"छोड़ो"</b> (खाली छोड़ें). किसी भी खाने पर टैप करें तो वही प्रश्न पूछा जाएगा।</div>
+    <div class="hint">प्रश्न पूरा सुनने के बाद <b>बीप</b> बजेगी — उसके बाद बोलिए। बोलकर भी चला सकते हैं: <b>"अगला"</b> · <b>"पीछे"</b> · <b>"दोबारा"</b> · <b>"छोड़ो"</b> (खाली छोड़ें). किसी भी खाने पर टैप करें तो वही प्रश्न पूछा जाएगा।</div>
   </section>
 
   <div id="form"></div>
@@ -229,46 +229,64 @@ function speak(text){return new Promise(res=>{
 function setStatus(kind,txt){$("dot").className="dot "+(kind||"");$("statusTxt").textContent=txt}
 function showHeard(fin,int){$("heard").querySelector(".final").textContent=fin;$("heard").querySelector(".interim").textContent=int?(" "+int):""}
 
-let accepting=false, consumed=0, lastLen=0, noSpeechT=null, beginT=null, gotText="";
-function ensureRec(){
-  if(!SR||rec) return;
+let accepting=false, noSpeechT=null, beginT=null, gotText="", recGen=0, curPrompt="", actx=null;
+/* The mic is OFF while the question is read aloud. It opens only after the beep,
+   so the phone's own voice is never written into the answer. */
+function beep(){ try{ actx=actx||new (window.AudioContext||window.webkitAudioContext)(); if(actx.state==="suspended") actx.resume();
+  const o=actx.createOscillator(), g=actx.createGain(); o.frequency.value=880;
+  g.gain.setValueAtTime(0.18,actx.currentTime); g.gain.exponentialRampToValueAtTime(0.001,actx.currentTime+0.18);
+  o.connect(g); g.connect(actx.destination); o.start(); o.stop(actx.currentTime+0.2);}catch(e){} }
+function closeRec(){ recGen++; if(rec){const r=rec; rec=null; r.onresult=null; r.onend=null; r.onerror=null; try{r.abort()}catch(e){}} }
+function openRec(){
+  if(!SR) return; closeRec(); const gen=recGen;
   const r=new SR(); r.lang="hi-IN"; r.continuous=true; r.interimResults=true;
-  consumed=0; lastLen=0;
   r.onresult=e=>{
-    lastLen=e.results.length;
-    if(!accepting) return;                       // question still being read: ignore
+    if(gen!==recGen||!accepting) return;
     let fin="",int="";
-    for(let i=consumed;i<e.results.length;i++){const t=e.results[i][0].transcript.trim();
+    for(let i=0;i<e.results.length;i++){const t=e.results[i][0].transcript.trim();
       if(e.results[i].isFinal) fin+=(fin?" ":"")+t; else int+=(int?" ":"")+t;}
     gotText=(fin+" "+int).trim(); showHeard(fin,int);
     if(gotText){ clearTimeout(noSpeechT); clearTimeout(silenceT); silenceT=setTimeout(()=>finalize(gotText),2200); } // 2.2 s pause = answer done
   };
   r.onerror=e=>{
+    if(gen!==recGen) return;
     if(e.error==="not-allowed"||e.error==="service-not-allowed"){toast("माइक की अनुमति दीजिए (ब्राउज़र में 🔒 आइकन)");stopAll();}
     else if(e.error==="network"){toast("इंटरनेट चेक करें — आवाज़ पहचान के लिए इंटरनेट चाहिए");}
   };
-  r.onend=()=>{                                   // Chrome closes long sessions by itself; reopen quietly
-    if(rec!==r) return; rec=null;
-    if(accepting&&gotText){ finalize(gotText); }
-    if(running) setTimeout(()=>{ if(running&&!rec){ ensureRec(); } },250);
+  r.onend=()=>{
+    if(gen!==recGen) return; rec=null;
+    if(!accepting) return;
+    if(gotText) finalize(gotText);
+    else setTimeout(()=>{ if(accepting&&gen===recGen) openRec(); },200);   // Chrome stopped early: keep listening
   };
   rec=r; try{r.start()}catch(e){}
 }
+const norm=s=>s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu," ").trim();
+function isEcho(t){                                // safety net: answer that is just the question repeated
+  const a=norm(t), q=norm(curPrompt); if(!a) return true; if(a===q) return true;
+  const w=a.split(" "), qw=new Set(q.split(" ")); const hit=w.filter(x=>qw.has(x)).length;
+  return w.length>=3 && hit/w.length>=0.7;
+}
 function beginAnswer(){
   clearTimeout(beginT);
-  beginT=setTimeout(()=>{                         // short gap so the tail of the spoken question isn't captured
+  beginT=setTimeout(()=>{                         // short gap after the voice stops, then beep and open the mic
     if(!running) return;
-    ensureRec(); consumed=lastLen; gotText=""; accepting=true; showHeard("","");
-    setStatus("listen","सुन रहा है… बोलिए"); $("heard").classList.add("listening");
+    gotText=""; accepting=true; showHeard("","");
+    beep(); setStatus("listen","बीप के बाद बोलिए…"); $("heard").classList.add("listening");
+    setTimeout(()=>{ if(accepting) openRec(); },250);
     clearTimeout(noSpeechT);
-    noSpeechT=setTimeout(()=>{ if(accepting&&!gotText){ pauseInput(); setStatus("","कुछ सुनाई नहीं दिया — 🎤 दोबारा बोलें दबाइए"); } },10000);
-  },400);
+    noSpeechT=setTimeout(()=>{ if(accepting&&!gotText){ pauseInput(); setStatus("","कुछ सुनाई नहीं दिया — 🎤 दोबारा बोलें दबाइए"); } },12000);
+  },500);
 }
-function pauseInput(){accepting=false;clearTimeout(silenceT);clearTimeout(noSpeechT);clearTimeout(beginT);$("heard").classList.remove("listening")}
-function finalize(text){ if(!accepting) return; pauseInput(); consumed=lastLen; gotText=""; handleAnswer(text.trim()); }
+function pauseInput(){accepting=false;clearTimeout(silenceT);clearTimeout(noSpeechT);clearTimeout(beginT);closeRec();$("heard").classList.remove("listening")}
+function finalize(text){
+  if(!accepting) return;
+  if(isEcho(text)){ gotText=""; showHeard("",""); setStatus("listen","अपना जवाब बोलिए…"); clearTimeout(silenceT); openRec(); return; }
+  pauseInput(); gotText=""; handleAnswer(text.trim());
+}
 function stopAll(){ running=false; pauseInput(); clearTimeout(nextT);
   if("speechSynthesis" in window) speechSynthesis.cancel();
-  if(rec){const r=rec;rec=null;try{r.abort()}catch(e){}} updateBtns(); }
+  updateBtns(); }
 
 const CMD={next:/^(अगला|आगे|next|नेक्स्ट)$/i, back:/^(पीछे|back|बैक)$/i, again:/^(दोबारा|फिर से|repeat|रिपीट)$/i, skip:/^(छोड़ो|छोड़ दो|खाली|नहीं पता|skip|स्किप)$/i};
 function handleAnswer(t){
@@ -290,7 +308,7 @@ function mark(){const el=$("in_"+FIELDS[cur].id);el.closest(".f").classList.togg
 
 /* ---------- Flow ---------- */
 async function ask(){
-  clearTimeout(nextT); pauseInput(); ensureRec(); const f=FIELDS[cur];
+  clearTimeout(nextT); pauseInput(); const f=FIELDS[cur]; curPrompt=f.say;
   document.querySelectorAll(".f").forEach(el=>el.classList.toggle("active",el.dataset.id===f.id));
   const el=document.querySelector(`.f[data-id="${f.id}"]`);
   el.scrollIntoView({block:"center",behavior:matchMedia("(prefers-reduced-motion:reduce)").matches?"auto":"smooth"});
@@ -322,10 +340,10 @@ function updateBtns(){
 }
 $("startBtn").onclick=()=>{
   if(running){ stopAll(); setStatus("","रुका हुआ"); return }
-  running=true; ensureRec(); if(cur<0){go(0)} else ask();
+  running=true; try{actx=actx||new (window.AudioContext||window.webkitAudioContext)();actx.resume();}catch(e){} if(cur<0){go(0)} else ask();
 };
 $("repeatBtn").onclick=()=>{running=true;ask()};
-$("reBtn").onclick=()=>{running=true;clearTimeout(nextT);if("speechSynthesis" in window) speechSynthesis.cancel();pauseInput();ensureRec();beginAnswer();updateBtns()};
+$("reBtn").onclick=()=>{running=true;clearTimeout(nextT);if("speechSynthesis" in window) speechSynthesis.cancel();pauseInput();beginAnswer();updateBtns()};
 $("backBtn").onclick=()=>{running=true;go(cur-1)};
 $("nextBtn").onclick=()=>{running=true;cur=Math.min(cur,FIELDS.length-1);go(cur+1)};
 /* ---------- Script mode ---------- */
